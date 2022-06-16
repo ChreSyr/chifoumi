@@ -110,7 +110,6 @@ class Network:
         if self._client_id is not None:
             raise PermissionError("This network is already connected to a server")
 
-        print(self.addr)
         self._client.connect(self.addr)
         self._client_id = int(self._client.recv(2048).decode())
 
