@@ -1,103 +1,8 @@
 import socket
 
 import baopig as bp
-import pygame
 
-from networking import Player, Game, Network, console_debug
-
-
-class ChifoumiPlayer(Player):
-
-    def __init__(self, ingame_id):
-
-        self.ingame_id = ingame_id  # Can change from a game to another
-        self.choice = None
-
-    chose = property(lambda self: self.choice is not None)
-
-
-class ChifoumiGame(Game):
-
-    MAX_PLAYERS_AMOUNT = 2
-
-    def __init__(self, id):
-
-        Game.__init__(self, id)
-
-        self.wins = [0, 0]
-        self.ties = 0
-        self.p1 = None
-        self.p2 = None
-
-        def newgame():
-            self._add_news("newgame")
-            self.reset_chose()
-        self.newgame_timer = bp.Timer(3, newgame)
-
-    def action(self, data, player_id):
-
-        if data == "get_news":
-            return self._send_news(player_id)
-        if data == "get_game":
-            raise PermissionError
-        else:
-            self.play(player_id, data)
-
-    def both_chose(self):
-
-        return self._players[0].chose and self._players[1].chose
-
-    def handle_close(self):
-
-        self.newgame_timer.cancel()
-
-    def get_player(self, player_id):
-
-        return self._players[player_id]
-
-    def play(self, player_id, move):
-
-        assert move in ("PIERRE", "PAPIER", "CISEAUX")
-        self._players[player_id].choice = move
-        self._add_news(f"choice:{player_id}:{move}")
-
-        if self.both_chose():
-            self._add_news(f"winner:{self.get_winner()}")
-            self.newgame_timer.start()
-
-    def rem_player(self, player):
-
-        super().rem_player(player)
-        self._want_to_be_closed = True
-
-    def reset_chose(self):
-
-        for player in self._players.values():
-            player.choice = None
-
-    def get_winner(self):
-
-        p1 = self._players[0].choice[-1]
-        p2 = self._players[1].choice[-1]
-
-        if p1 == p2:  # Tie
-            return -1
-
-        winner = -1
-        if p1 == "E" and p2 == "X":
-            winner = 0
-        elif p1 == "X" and p2 == "E":
-            winner = 1
-        elif p1 == "R" and p2 == "E":
-            winner = 0
-        elif p1 == "E" and p2 == "R":
-            winner = 1
-        elif p1 == "X" and p2 == "R":
-            winner = 0
-        elif p1 == "R" and p2 == "X":
-            winner = 1
-
-        return winner
+from networking import Client
 
 
 class ChifoumiApp(bp.Application):
@@ -109,13 +14,18 @@ class ChifoumiApp(bp.Application):
 
         # MENU
         menu_scene = bp.Scene(self, name="menu")
-        bp.Button(menu_scene, "JOUER !", sticky="center", size=(600, 200),
+        bp.Button(menu_scene, "JOUER !", sticky="center", pos=(0, "30%"), size=(600, 200),
                   command=bp.PrefilledFunction(self.open, "waiting"))
-        self.ipaddr = "127.0.0.1"
+        self.ipaddr = "172.20.10.2"
         servaddr_title = bp.Text(menu_scene, "adresse IP du serveur :", pos=("50%", "10%"), loc="midtop")
         bp.Entry(menu_scene, text=self.ipaddr, width=280, entry_type=str,
                  loc="midtop", ref=servaddr_title, refloc="midbottom",
                  command=lambda text: setattr(self, "ipaddr", text))
+        self.port = 5500
+        port_title = bp.Text(menu_scene, "port du serveur :", pos=("50%", "30%"), loc="midtop")
+        bp.Entry(menu_scene, text=str(self.port), width=280, entry_type=int,
+                 loc="midtop", ref=port_title, refloc="midbottom",
+                 command=lambda text: setattr(self, "port", int(text)))
 
         # WAITING
         wait_scene = WaitScene(self, name="waiting")
@@ -130,7 +40,7 @@ class ChifoumiApp(bp.Application):
         # PLAYGROUND
         self.play_scene = PlayScene(self, "playground")
         def menu():
-            self.play_scene.network.disconnect()
+            self.play_scene.client.disconnect()
             self.open("menu")
         bp.Button(wait_scene, "MENU", command=menu)
         bp.Button(self.play_scene, "MENU", command=menu)
@@ -139,17 +49,19 @@ class ChifoumiApp(bp.Application):
         self.set_style_for(bp.DialogFrame, width="80%")
         self.end_dialog = bp.Dialog(self, title="Votre adversaire a quitté\nla partie en cours",
                                     choices=("MENU", "NOUVELLE PARTIE"), name="end_dialog")
+        self.error_dialog = bp.Dialog(self, title="Une erreur est survenue", choices=("MENU",), name="error_dialog")
         def click_end_dialog(choice):
             if choice == "MENU":
                 menu_scene.open()
             else:
                 wait_scene.open()
         self.end_dialog.signal.ANSWERED.connect(click_end_dialog, owner=None)
+        self.error_dialog.signal.ANSWERED.connect(click_end_dialog, owner=None)
 
     def close(self):
 
-        if self.play_scene.network and self.play_scene.network.is_connected:
-            self.play_scene.network.disconnect()
+        if self.play_scene.client and self.play_scene.client.is_connected:
+            self.play_scene.client.disconnect()
 
 
 class WaitScene(bp.Scene):
@@ -165,13 +77,13 @@ class WaitScene(bp.Scene):
         play = self.application.play_scene
 
         try:
-            play.network = Network(ip_addr=self.application.ipaddr, port=5554)
+            play.client = Client(ip_addr=self.application.ipaddr, port=self.application.port)
         except socket.error:
             bp.LOGGER.warning(f"No server found at address {self.application.ipaddr}")
             return self.application.open("menu")
 
         super().open()
-        play.client_id = play.network.get_client_id()
+        play.client_id = play.client.id
         play.you_are_player.set_text(f"Vous êtes le joueur n°{play.client_id}")
         if self.application.search_animator.is_running:
             self.application.search_animator.cancel()
@@ -179,7 +91,7 @@ class WaitScene(bp.Scene):
 
     def run(self):
 
-        if self.application.play_scene.network.send("/game_started") == "True":
+        if self.application.play_scene.client.send("/game_started?") == "True":
             self.application.play_scene.open()
 
 
@@ -189,7 +101,7 @@ class PlayScene(bp.Scene):
 
         bp.Scene.__init__(self, app, name=name)
 
-        self.network = None
+        self.client = None
         self.client_id = None
         self.game = None
 
@@ -215,7 +127,7 @@ class PlayScene(bp.Scene):
                 self.chose = True
                 self.choice_text.set_text(btn.text_widget.text)
                 self.choice_text.show()
-                self.network.send(btn.text_widget.text)
+                self.client.send(btn.text_widget.text)
         self.rock = ChoiceButton(btns_zone, "PIERRE", sticky="midleft", name="Rock")
         self.paper = ChoiceButton(btns_zone, "PAPIER", sticky="center", name="Paper")
         self.scissors = ChoiceButton(btns_zone, "CISEAUX", sticky="midright", name="Scissors")
@@ -230,18 +142,21 @@ class PlayScene(bp.Scene):
 
     def run(self):
 
-        if console_debug: print("RUN")
-
         try:
-            all_news = self.network.send("get_news")
-            if console_debug: print(f"RECEIVED NEWS : -{all_news}-")
+            all_news = self.client.send("get_news")
+            # bp.LOGGER.fine(f"RECEIVED NEWS : -{all_news}-")
             if all_news is None:
-                return self.app.end_dialog.open()
+                self.application.error_dialog.set_description("Le serveur a cessé de fonctionner")
+                return self.application.error_dialog.open()
             if all_news != "n":
                 for news in all_news.split("|"):
                     if not news:  # always a first empty string
                         continue
-                    if console_debug: print("NEWS :", news)
+
+                    if news == "-":  # empty answer
+                        continue
+                    if news == "n":  # empty answer
+                        continue
 
                     if news == "newgame":
                         self.choice_text.hide()
@@ -255,6 +170,11 @@ class PlayScene(bp.Scene):
                         if int(player_id) != self.client_id:
                             self.other_choice = choice
 
+                    elif news.startswith("quit:"):
+                        if self.client.is_connected:
+                            self.client.disconnect()
+                        self.application.end_dialog.open()
+
                     elif news.startswith("winner:"):
                         winner = int(news[7:])
                         if winner == self.client_id:
@@ -267,11 +187,15 @@ class PlayScene(bp.Scene):
                         self.result.show()
                         self.other_choice_text.set_text(self.other_choice)
 
+                    else:
+                        raise NotImplementedError(f"Unknown news : {news}")
+
         except Exception as e:  # game has been deleted while this client was doing stuff
             bp.LOGGER.warning(e)
-            if self.network.is_connected:
-                self.network.disconnect()
-            self.application.end_dialog.open()
+            if self.client.is_connected:
+                self.client.disconnect()
+            self.application.error_dialog.set_description(e)
+            self.application.error_dialog.open()
 
 
 if __name__ == '__main__':

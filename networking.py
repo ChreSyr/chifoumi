@@ -1,44 +1,47 @@
 
 
+import math
 import socket
 from _thread import start_new_thread
 import baopig as bp
 from baopig.time.timemanager import time_manager, _running_timers
-console_debug = False
+# bp.LOGGER.cons_handler.setLevel(5)
 
 
 class Player:
 
-    def __init__(self, ingame_id):
+    def __init__(self, client_id):
 
-        self.ingame_id = ingame_id  # Can change from a game to another
+        self.client_id = client_id  # Id of the client who controls this player
 
 
 class Game:
 
-    MAX_PLAYERS_AMOUNT = None
+    MAX_PLAYERS_AMOUNT = math.inf
 
     def __init__(self, id):
 
         self.id = id
         self._is_looking_for_player = True
         self._want_to_be_closed = False
-        self._players = {}
+        self._players = {}  # players by client_id
         self.players_id = []
-        self._news = {}
+        self._news = {}  # news by client_id
 
         self._connections = {}
 
         bp.LOGGER.info(f"Creating {self}")
 
+    looking_for_players = property(lambda self: len(self.players_id) < self.MAX_PLAYERS_AMOUNT)
+
     def __str__(self):
 
         return self.__class__.__name__ + f"(id={self.id})"
 
-    def _add_connection(self, connection, player_id):
+    def _add_connection(self, connection, client_id):
 
-        assert player_id not in self._connections
-        self._connections[player_id] = connection
+        assert client_id not in self._connections
+        self._connections[client_id] = connection
 
     def _add_news(self, news):
         
@@ -53,94 +56,89 @@ class Game:
         self.handle_close()
         bp.LOGGER.info(f"Closing {self}")
 
-    def _send_news(self, player_id):
+    def _get_news(self, client_id):
 
-        news = self._news[player_id]
-        self._news[player_id] = "n"
+        news = self._news[client_id]
+        self._news[client_id] = "n"
         return news
 
-    def action(self, data, player_id):
+    def action(self, data, client_id):
         """
-        When network.send("abort"), the game receive a game.action("abort", network.player_id)
-        The return of this method is the return of network.send()
+        When client.send("abort"), the game receive a game.action("abort", client.id)
+        The return of this method is the return of Client.send()
         """
 
     def add_player(self, player):
         """Only called by Server.start_listening()"""
 
-        assert self._is_looking_for_player
-        assert player.ingame_id == len(self._players)
-        assert len(self._players) < self.MAX_PLAYERS_AMOUNT
-        self._players[player.ingame_id] = player
-        self.players_id.append(player.ingame_id)
-        self._news[player.ingame_id] = "n"
+        assert self.looking_for_players
+        self._players[player.client_id] = player
+        self.players_id.append(player.client_id)
+        self._news[player.client_id] = "n"
 
     def handle_close(self):
         """Only called by Server._threaded_client()"""
 
-    def rem_player(self, player_id):
+    def rem_player(self, client_id):
         """
         Only called by Server._threaded_client()
-        The return of this method is the return of network.disconnect()
+        The return of this method is the return of Client.disconnect()
         """
-        self._news.pop(player_id)
-        self.players_id.remove(player_id)
-        return self._players.pop(player_id)
+        self._news.pop(client_id)
+        self.players_id.remove(client_id)
+        self._players.pop(client_id)
+        self._add_news(f"quit:{client_id}")
 
 
-class Network:
+class Client:
     """
-    A Network is an object who establishes a discussion between a server and a client
-    The client is controlling a player remotely
-    The player is managed by a game
-    A game is only accessible to the server
+    A Client is an object who talks to a server
+    This client is controlling a player remotely (the game is only accessible to the server)
     """
 
     def __init__(self, ip_addr, port):
 
         self._client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.addr = (ip_addr, port)
-        self._client_id = None
+        self._id = None
         self._connect()
 
-    is_connected = property(lambda self: self._client_id is not None)
+    id = property(lambda self: self._id)
+    is_connected = property(lambda self: self._id is not None)
 
     def _connect(self):
 
-        if self._client_id is not None:
-            raise PermissionError("This network is already connected to a server")
+        if self._id is not None:
+            raise PermissionError("This client is already connected to a server")
 
         self._client.connect(self.addr)
-        self._client_id = int(self._client.recv(2048).decode())
+        self._id = int(self._client.recv(2048).decode())
+        bp.LOGGER.debug(f"This client received the ID : {self._id}")
 
     def disconnect(self):
 
-        if self._client_id is None:
-            raise PermissionError("This network is not connected to a server")
+        if self._id is None:
+            return bp.LOGGER.warning("The server closed the connection")
 
-        self._client_id = None
+        self._id = None
         try:
             self.send("/SOCKET-DETACH")
             self._client.detach()
+            bp.LOGGER.debug("Disconnection")
         except socket.error:
             pass
-
-    def get_client_id(self):
-
-        return self._client_id
 
     def send(self, data):
 
         try:
-            if console_debug: print(f"SENDING DATA = -{data}-")
+            bp.LOGGER.fine(f"SENDING DATA = -{data}-")
             self._client.send(str.encode(data))
-            if console_debug: print(f"WAITING FOR DATA")
             a = self._client.recv(2048*2).decode()
-            if console_debug: print(f"RECEIVED DATA 0 = -{a}-")
+            bp.LOGGER.fine(f"RECEIVED DATA 0 = -{a}-")
             return a
         except socket.error:
             # self.disconnect()
-            self._client_id = None
+            self._id = None
             try:
                 self._client.detach()
             except socket.error:
@@ -184,49 +182,51 @@ class Server:
         while True:
             self.time_manager.update()
 
-    def _threaded_client(self, conn, player_id, game_id):
+    def _threaded_client(self, conn, client_id, game_id):
 
-        self._send(conn, player_id)  # -> network.player_id
+        self._send(conn, client_id)  # -> client.id
         game = self._games[game_id]
 
         try:
             while True:
 
-                if game._want_to_be_closed:
-                    break
+                bp.LOGGER.debug(f"THREAD RUN : {client_id}")
+
+                # if game._want_to_be_closed:
+                #     break
 
                 data = conn.recv(4096).decode()
-                if console_debug: print(f"RECEIVED DATA FROM {player_id} : -{data}-")
+                bp.LOGGER.fine(f"RECEIVED DATA FROM PLAYER n°{client_id} : -{data}-")
                 if not data:
                     break
 
                 if data.startswith("/"):
                     if data == "/SOCKET-DETACH":
-                        self._sendall(conn, game.rem_player(player_id))
+                        game.rem_player(client_id)
+                        self._sendall(conn, "-")
                         break
-                    if data == "/game_started":
-                        self._sendall(conn, not game._is_looking_for_player)
+                    if data == "/game_started?":
+                        self._sendall(conn, not game.looking_for_players)
                 elif game.id in self._games:
-                    a = game.action(data, player_id)
+                    a = game.action(data, client_id)
                     if a == "":
                         a = "-"  # not "" because it would be considered as a disconnection
-                    if console_debug: print(f"ANSWER FOR {player_id} : -{a}-")
+                    bp.LOGGER.fine(f"ANSWER FOR {client_id} : -{a}-")
                     self._sendall(conn, a)
                 else:
-                    if console_debug: print("GAME ENDED FROM OTHER PLAYER")
+                    bp.LOGGER.debug(f"Player n°{client_id} left the game")
                     break  # the game ended
 
-        except ConnectionResetError:  # game has been closed
-            pass
-        except OSError:  # game has been closed
-            pass
+        # except ConnectionResetError:  # game has been closed
+        #     pass
+        # except OSError:  # game has been closed
+        #     pass
         except Exception as e:
             print(e.__class__.__name__)
             bp.LOGGER.warning(e)
 
-        if game is self.game_looking_for_players:
-            self.game_looking_for_players = None
-        if game._want_to_be_closed:
+        # NOTE : if a player doesn't disconnect himself, is this thread going to stay forever ?
+        if len(game.players_id) == 0:
             self._games.pop(game.id)
             game._close()
 
@@ -237,24 +237,20 @@ class Server:
         bp.LOGGER.info(f"Waiting for a connection, Server Started : {self.addr}")
 
         game_id = 0
-        player_id = 0
 
         while True:
             conn, addr = self.socket.accept()
+            client_id = addr[1]  # the id is the port dedicated the client
 
             if self.game_looking_for_players is None:
-                player_id = 0
                 game_id += 1
                 self.game_looking_for_players = self._games[game_id] = self._game_class(game_id)
-            else:
-                player_id += 1
-            self.game_looking_for_players.add_player(self._player_class(player_id))
+            self.game_looking_for_players.add_player(self._player_class(client_id))
 
             # Create a new thread for each player, connected to the last game
-            self.game_looking_for_players._add_connection(conn, player_id)
-            start_new_thread(self._threaded_client, (conn, player_id, self.game_looking_for_players.id))
+            self.game_looking_for_players._add_connection(conn, client_id)
+            start_new_thread(self._threaded_client, (conn, client_id, self.game_looking_for_players.id))
 
             bp.LOGGER.info(f"Connected {addr} to {self.game_looking_for_players}")
-            if player_id == self.game_looking_for_players.MAX_PLAYERS_AMOUNT - 1:
-                self.game_looking_for_players._is_looking_for_player = False
+            if not self.game_looking_for_players.looking_for_players:
                 self.game_looking_for_players = None
